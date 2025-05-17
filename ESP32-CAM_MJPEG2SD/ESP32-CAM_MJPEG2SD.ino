@@ -9,7 +9,7 @@
 
 void setup() {
   logSetup();
-  LOG_INF("Selected board %s", CAM_BOARD);
+  LOG_INF("Selected board %s", CAM_BOARD); 
   // prep storage
   if (startStorage()) {
     // Load saved user configuration
