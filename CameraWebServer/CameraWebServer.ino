@@ -43,6 +43,14 @@ uint8_t *prevFrame;
 uint8_t *currentFrame;
 bool isFirstFrame = true;
 
+volatile bool motionCheckFlag = false;
+
+hw_timer_t * timer = NULL;
+
+void IRAM_ATTR onTimer() {
+  motionCheckFlag = true;
+}
+
 bool downscaleGrayscale(const camera_fb_t *fb, uint8_t *output) {
   if (fb->format != PIXFORMAT_RGB565) return false;
 
@@ -51,9 +59,10 @@ bool downscaleGrayscale(const camera_fb_t *fb, uint8_t *output) {
 
   for (int y = 0; y < FRAME_HEIGHT; y++) {
     for (int x = 0; x < FRAME_WIDTH; x++) {
-      uint8_t graySamples[9];
-      int count = 0;
+      float graySum = 0;
+      int samples = 0;
 
+      // Sample a 3x3 region for light smoothing (blur)
       for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
           int srcX = min(max((int)((x + dx) * skipX), 0), (int)(fb->width - 1));
@@ -73,23 +82,12 @@ bool downscaleGrayscale(const camera_fb_t *fb, uint8_t *output) {
           b = (b * 255) / 31;
 
           uint8_t gray = (uint8_t)(0.299 * r + 0.587 * g + 0.114 * b);
-          graySamples[count++] = gray;
+          graySum += gray;
+          samples++;
         }
       }
 
-      // Sort graySamples and pick the median
-      for (int i = 0; i < count - 1; i++) {
-        for (int j = i + 1; j < count; j++) {
-          if (graySamples[i] > graySamples[j]) {
-            uint8_t temp = graySamples[i];
-            graySamples[i] = graySamples[j];
-            graySamples[j] = temp;
-          }
-        }
-      }
-
-      uint8_t medianGray = graySamples[count / 2];
-      output[y * FRAME_WIDTH + x] = medianGray;
+      output[y * FRAME_WIDTH + x] = (uint8_t)(graySum / samples);
     }
   }
 
@@ -229,6 +227,20 @@ void setup() {
   setupLedFlash(LED_GPIO_NUM);
 #endif
 
+  delay(500); // Give time for camera to stabilize
+
+  // Now initialize SD card after camera init
+  if (!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("SD Card Mount Failed");
+  } else {
+    uint8_t cardType = SD_MMC.cardType();
+    if (cardType == CARD_NONE) {
+      Serial.println("No SD card attached");
+    } else {
+      Serial.println("SD card initialized.");
+    }
+  }
+
   if (strlen(ssid) > 0) {
     // Try to connect to Wi-Fi
     WiFi.begin(ssid, password);
@@ -264,26 +276,33 @@ void setup() {
   Serial.println(IP);
 
   startCameraServer();
+  delay(5000);
+
+  // Timer setup for 500ms interval
+  timer = timerBegin(1000000);                 // 1MHz → 1µs/tick
+  timerAttachInterrupt(timer, &onTimer);       // Attach ISR function
+  timerAlarm(timer, 500000, true, 0);          // Auto-reload every 500ms
 }
 
-void loop() {
+void checkMotion() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed");
-    delay(500);
     return;
   }
-
-  Serial.printf("Got frame: %dx%d, format: %d, len: %d\n", fb->width, fb->height, fb->format, fb->len);
 
   if (fb->format != PIXFORMAT_RGB565) {
     Serial.println("Unexpected format, skipping");
   } else if (detectMotion(fb)) {
     Serial.println("Motion Detected!");
-  } else {
-    Serial.println("No Motion");
   }
 
   esp_camera_fb_return(fb);
-  delay(500);
+}
+
+void loop() {
+  if (motionCheckFlag) {
+    motionCheckFlag = false;
+    checkMotion();
+  }
 }
