@@ -37,7 +37,7 @@
 
 #define FRAME_WIDTH 96
 #define FRAME_HEIGHT 96
-#define MOTION_THRESHOLD 25
+#define MOTION_THRESHOLD 20
 
 uint8_t *prevFrame;
 uint8_t *currentFrame;
@@ -51,10 +51,9 @@ bool downscaleGrayscale(const camera_fb_t *fb, uint8_t *output) {
 
   for (int y = 0; y < FRAME_HEIGHT; y++) {
     for (int x = 0; x < FRAME_WIDTH; x++) {
-      float graySum = 0;
-      int samples = 0;
+      uint8_t graySamples[9];
+      int count = 0;
 
-      // Sample a 3x3 region for light smoothing (blur)
       for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
           int srcX = min(max((int)((x + dx) * skipX), 0), (int)(fb->width - 1));
@@ -74,12 +73,23 @@ bool downscaleGrayscale(const camera_fb_t *fb, uint8_t *output) {
           b = (b * 255) / 31;
 
           uint8_t gray = (uint8_t)(0.299 * r + 0.587 * g + 0.114 * b);
-          graySum += gray;
-          samples++;
+          graySamples[count++] = gray;
         }
       }
 
-      output[y * FRAME_WIDTH + x] = (uint8_t)(graySum / samples);
+      // Sort graySamples and pick the median
+      for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+          if (graySamples[i] > graySamples[j]) {
+            uint8_t temp = graySamples[i];
+            graySamples[i] = graySamples[j];
+            graySamples[j] = temp;
+          }
+        }
+      }
+
+      uint8_t medianGray = graySamples[count / 2];
+      output[y * FRAME_WIDTH + x] = medianGray;
     }
   }
 
