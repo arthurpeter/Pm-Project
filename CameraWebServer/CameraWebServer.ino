@@ -35,9 +35,9 @@
 //#define CAMERA_MODEL_DFRobot_Romeo_ESP32S3 // Has PSRAM
 #include "camera_pins.h"
 
-#define FRAME_WIDTH 96
-#define FRAME_HEIGHT 96
-#define MOTION_THRESHOLD 20
+#define FRAME_WIDTH 64
+#define FRAME_HEIGHT 64
+#define MOTION_THRESHOLD 2
 
 uint8_t *prevFrame;
 uint8_t *currentFrame;
@@ -47,50 +47,115 @@ volatile bool motionCheckFlag = false;
 
 hw_timer_t * timer = NULL;
 
+#include <esp32-hal-psram.h>
+
+// AVI parameters
+#define FRAMES_PER_SECOND 10
+#define AVI_HEADER_SIZE 512
+uint32_t frame_counter = 0;
+
+bool isRecording = false;
+unsigned long recordingStartTime = 0;
+const unsigned long recordingDuration = 5000; // 5 seconds
+File videoFile;
+int fileCounter = 0;
+
+uint32_t frame_offsets[50]; // Stores file positions of each frame
+uint32_t frame_sizes[50];   // Stores sizes of each frame
+uint16_t frame_index = 0; 
+
+uint8_t *psramBuffer = NULL; // For SD card writes
+size_t psramBufferSize = 0;
+
 void IRAM_ATTR onTimer() {
-  motionCheckFlag = true;
+  if (!isRecording) {
+    motionCheckFlag = true;
+  }
+}
+
+void startRecording() {
+  char filename[32];
+  snprintf(filename, sizeof(filename), "/motion_%d.mjpeg", fileCounter++);
+  videoFile = SD_MMC.open(filename, FILE_WRITE);
+  if (!videoFile) {
+    Serial.println("Failed to create .mjpeg");
+    return;
+  }
+  Serial.printf("Recording MJPEG to %s\n", filename);
+  isRecording = true;
+  recordingStartTime = millis();
+}
+
+void stopRecording() {
+  if (!isRecording) return;
+  videoFile.close();
+  isRecording = false;
+  isFirstFrame = true;
+  Serial.println("MJPEG recording finished");
 }
 
 bool downscaleGrayscale(const camera_fb_t *fb, uint8_t *output) {
-  if (fb->format != PIXFORMAT_RGB565) return false;
+  if (fb->format != PIXFORMAT_JPEG) {
+    Serial.println("Not a JPEG frame");
+    return false;
+  }
 
-  float skipX = (float)fb->width / FRAME_WIDTH;
-  float skipY = (float)fb->height / FRAME_HEIGHT;
+  uint32_t width = fb->width;
+  uint32_t height = fb->height;
 
+  // Allocate RGB888 buffer in PSRAM
+  size_t rgb_len = width * height * 3;  // 3 bytes/pixel (RGB888)
+  uint8_t *rgb_buf = (uint8_t*)heap_caps_malloc(rgb_len, MALLOC_CAP_SPIRAM);
+  
+  if (!rgb_buf) {
+    Serial.println("Failed to allocate RGB buffer");
+    return false;
+  }
+  
+  bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb_buf);
+  if (!converted || !rgb_buf) {
+    Serial.println("JPEG to RGB conversion failed");
+    return false;
+  }
+
+  // Calculate scaling ratios
+  const float x_ratio = static_cast<float>(width) / FRAME_WIDTH;
+  const float y_ratio = static_cast<float>(height) / FRAME_HEIGHT;
+
+  // Process each target pixel
   for (int y = 0; y < FRAME_HEIGHT; y++) {
     for (int x = 0; x < FRAME_WIDTH; x++) {
-      float graySum = 0;
-      int samples = 0;
+      uint32_t gray_sum = 0;
+      uint16_t samples = 0;
 
-      // Sample a 3x3 region for light smoothing (blur)
+      // Sample 3x3 grid for anti-aliasing
       for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
-          int srcX = min(max((int)((x + dx) * skipX), 0), (int)(fb->width - 1));
-          int srcY = min(max((int)((y + dy) * skipY), 0), (int)(fb->height - 1));
-          int index = (srcY * fb->width + srcX) * 2;
+          // Calculate source coordinates with boundary checks
+          int src_x = std::min(std::max(static_cast<int>((x + dx) * x_ratio), 0), static_cast<int>(width - 1));
+          int src_y = std::min(std::max(static_cast<int>((y + dy) * y_ratio), 0), static_cast<int>(height - 1));
 
-          if (index < 0 || index + 1 >= fb->len) continue;
+          // Get RGB values (3 bytes per pixel)
+          uint8_t *pixel = &rgb_buf[(src_y * width + src_x) * 3];
+          
+          // Convert to grayscale using integer math
+          uint8_t gray = static_cast<uint8_t>(
+            (77 * pixel[0] +    // R component (0.299 * 255 ≈ 76.245)
+           150 * pixel[1] +    // G component (0.587 * 255 ≈ 149.685)
+            29 * pixel[2])     // B component (0.114 * 255 ≈ 29.07)
+            >> 8);             // Divide by 256
 
-          uint16_t pixel = fb->buf[index] | (fb->buf[index + 1] << 8);
-
-          uint8_t r = (pixel >> 11) & 0x1F;
-          uint8_t g = (pixel >> 5) & 0x3F;
-          uint8_t b = pixel & 0x1F;
-
-          r = (r * 255) / 31;
-          g = (g * 255) / 63;
-          b = (b * 255) / 31;
-
-          uint8_t gray = (uint8_t)(0.299 * r + 0.587 * g + 0.114 * b);
-          graySum += gray;
+          gray_sum += gray;
           samples++;
         }
       }
 
-      output[y * FRAME_WIDTH + x] = (uint8_t)(graySum / samples);
+      // Store averaged result
+      output[y * FRAME_WIDTH + x] = static_cast<uint8_t>(gray_sum / samples);
     }
   }
 
+  free(rgb_buf);  // Free allocated RGB buffer
   return true;
 }
 
@@ -154,8 +219,8 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.frame_size = FRAMESIZE_UXGA;
-  //config.pixel_format = PIXFORMAT_JPEG;  // for streaming
-  config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
+  config.pixel_format = PIXFORMAT_JPEG;  // for streaming
+  //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
@@ -210,7 +275,7 @@ void setup() {
   }
   // drop down frame size for higher initial frame rate
   if (config.pixel_format == PIXFORMAT_JPEG) {
-    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_framesize(s, FRAMESIZE_SVGA);
   }
 
 #if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
@@ -230,6 +295,7 @@ void setup() {
   delay(500); // Give time for camera to stabilize
 
   // Now initialize SD card after camera init
+  SD_MMC.end();
   if (!SD_MMC.begin("/sdcard", true)) {
     Serial.println("SD Card Mount Failed");
   } else {
@@ -291,18 +357,34 @@ void checkMotion() {
     return;
   }
 
-  if (fb->format != PIXFORMAT_RGB565) {
-    Serial.println("Unexpected format, skipping");
-  } else if (detectMotion(fb)) {
+  if (detectMotion(fb)) {
     Serial.println("Motion Detected!");
+    if (!isRecording) {
+      startRecording();
+    }
   }
 
   esp_camera_fb_return(fb);
 }
 
 void loop() {
-  if (motionCheckFlag) {
+  if(motionCheckFlag) {
     motionCheckFlag = false;
     checkMotion();
+  }
+
+  if (isRecording) {
+    static uint32_t last_frame = 0;
+    if (millis() - last_frame >= 100) {
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (fb) {
+        videoFile.write(fb->buf, fb->len);
+        esp_camera_fb_return(fb);
+        last_frame = millis();
+      }
+    }
+    if (millis() - recordingStartTime >= recordingDuration) {
+      stopRecording();
+    }
   }
 }
