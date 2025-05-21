@@ -180,8 +180,53 @@ bool detectMotion(const camera_fb_t *fb) {
   float avgDiff = (float)diffSum / (FRAME_WIDTH * FRAME_HEIGHT);
   memcpy(prevFrame, currentFrame, FRAME_WIDTH * FRAME_HEIGHT); // Update previous
 
-  Serial.printf("Average diff: %.2f\n", avgDiff);
+  //Serial.printf("Average diff: %.2f\n", avgDiff);
   return avgDiff > MOTION_THRESHOLD;
+}
+
+int getLastFileNumber() {
+  int maxNumber = -1;
+  File root = SD_MMC.open("/");
+  if (!root) {
+    Serial.println("Failed to open directory");
+    return 0;
+  }
+
+  Serial.println("Scanning existing files:");
+  File file = root.openNextFile();
+  while (file) {
+    if (!file.isDirectory()) {
+      String fileName = file.name();
+
+      // Check both with and without leading slash
+      if (fileName.startsWith("/motion_") || fileName.startsWith("motion_")) {
+        if (fileName.endsWith(".mjpeg")) {
+          // Remove leading slash if present
+          if (fileName.startsWith("/")) {
+            fileName = fileName.substring(1);
+          }
+          
+          int start = fileName.indexOf('_') + 1;
+          int end = fileName.indexOf('.');
+          
+          if (start > 0 && end > start) {
+            String numberStr = fileName.substring(start, end);
+            
+            int fileNumber = numberStr.toInt();
+            
+            if (fileNumber > maxNumber) {
+              maxNumber = fileNumber;
+            }
+          }
+        }
+      }
+    }
+    file = root.openNextFile();
+  }
+  
+  Serial.print("Max file number found: ");
+  Serial.println(maxNumber);
+  return maxNumber + 1;
 }
 
 // ===========================
@@ -304,6 +349,9 @@ void setup() {
       Serial.println("No SD card attached");
     } else {
       Serial.println("SD card initialized.");
+      // Get next available file number
+      fileCounter = getLastFileNumber();
+      Serial.printf("Next file number: %d\n", fileCounter);
     }
   }
 
@@ -375,13 +423,11 @@ void loop() {
 
   if (isRecording) {
     static uint32_t last_frame = 0;
-    if (millis() - last_frame >= 100) {
-      camera_fb_t *fb = esp_camera_fb_get();
-      if (fb) {
-        videoFile.write(fb->buf, fb->len);
-        esp_camera_fb_return(fb);
-        last_frame = millis();
-      }
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) {
+      videoFile.write(fb->buf, fb->len);
+      esp_camera_fb_return(fb);
+      last_frame = millis();
     }
     if (millis() - recordingStartTime >= recordingDuration) {
       stopRecording();
